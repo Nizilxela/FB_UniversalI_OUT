@@ -1,0 +1,175 @@
+FUNCTION_BLOCK "FB_OutputMapper"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 1.0
+
+   VAR_INPUT
+      apply_config   : Bool;                      // HMI: кнопка "Применить" (импульс)
+      reset_config   : Bool;                      // HMI: кнопка "Сбросить" (импульс + очистка карты)
+      physical_count : DInt;                      // НЕ для HMI: сколько физ. выходов реально есть (0..256)
+   END_VAR
+
+   VAR_IN_OUT
+      out            : Array[0..255] of Bool;     // НЕ для HMI: логические сигналы программы (источник)
+      i              : Array[0..255] of DInt;     // HMI: карта — i[k] = номер физ. выхода (-1 = не используется)
+      invert         : Array[0..255] of Bool;     // HMI: инверсия — TRUE = инвертировать канал k
+      Q              : Array[0..255] of Bool;     // НЕ для HMI: образ физ. выходов (блок пишет)
+   END_VAR
+
+   VAR_OUTPUT
+      error_duplicate : Bool;                     // HMI: аларм "есть дубликаты в карте"
+      error_channel_a : DInt;                     // HMI: первый конфликтующий канал (-1 = Н/Д)
+      error_channel_b : DInt;                     // HMI: второй конфликтующий канал (-1 = Н/Д)
+      error_range     : Bool;                     // HMI: аларм "номер выхода вне диапазона"
+      error_range_ch  : DInt;                     // HMI: канал с ошибкой диапазона (-1 = Н/Д)
+      config_valid    : Bool;                     // HMI: карта активна и корректна
+      last_apply_ok   : Bool;                     // HMI: последнее применение успешно
+      active_count    : DInt;                     // HMI: сколько каналов реально используется
+   END_VAR
+
+   VAR
+      apply_edge      : R_TRIG;                   // детектор фронта apply_config
+      reset_edge      : R_TRIG;                   // детектор фронта reset_config
+      active_i        : Array[0..255] of DInt;    // защищённая копия карты
+      active_invert   : Array[0..255] of Bool;    // защищённая копия инверсии
+      active_count    : DInt;                     // кол-во активных (не -1) каналов
+      has_config      : Bool := FALSE;            // есть ли применённая карта
+      loop_k          : DInt;                     // индекс цикла
+      phys_used       : Array[0..255] of Bool;    // занятость физ. выходов
+      phys_owner      : Array[0..255] of DInt;    // владелец физ. выхода (-1 = свободен)
+      validation_ok   : Bool;                     // результат валидации
+      phys_temp       : DInt;                     // временный физ. индекс
+   END_VAR
+
+BEGIN
+   // =========================================================================
+   // БЛОК 1. СБРОС КАРТЫ (reset_config)
+   // =========================================================================
+   #reset_edge(CLK := #reset_config);
+
+   // Реагируем только на фронт FALSE -> TRUE.
+   IF #reset_edge.Q THEN
+      // Сброс активной карты и диагностики.
+      #has_config      := FALSE;   // карта больше не активна
+      #active_count    := 0;       // активных каналов нет
+      #last_apply_ok   := FALSE;   // последнее применение аннулировано
+      #error_duplicate := FALSE;
+      #error_channel_a := -1;
+      #error_channel_b := -1;
+      #error_range     := FALSE;
+      #error_range_ch  := -1;
+
+      // Очистка карты HMI: все каналы "не используются", инверсия выключена.
+      // Пишем прямо в VAR_IN_OUT — HMI увидит изменения.
+      FOR #loop_k := 0 TO 255 DO
+         #i[#loop_k]      := -1;
+         #invert[#loop_k] := FALSE;
+      END_FOR;
+   END_IF;
+
+   // =========================================================================
+   // БЛОК 2. ПРИМЕНЕНИЕ КАРТЫ (apply_config)
+   // =========================================================================
+   #apply_edge(CLK := #apply_config);
+
+   IF #apply_edge.Q THEN
+      #validation_ok := TRUE;
+
+      #error_duplicate := FALSE;
+      #error_channel_a := -1;
+      #error_channel_b := -1;
+      #error_range     := FALSE;
+      #error_range_ch  := -1;
+
+      // ПРОВЕРКА 1: physical_count в диапазоне 0..256.
+      IF (#physical_count < 0) OR (#physical_count > 256) THEN
+         #validation_ok := FALSE;
+         #error_range   := TRUE;
+      END_IF;
+
+      // ПРОВЕРКА 2 и 3: обход карты — диапазон и дубликаты.
+      IF #validation_ok THEN
+         // Цикл 1: очистка карт занятости.
+         FOR #loop_k := 0 TO 255 DO
+            #phys_used[#loop_k]  := FALSE;
+            #phys_owner[#loop_k] := -1;
+         END_FOR;
+
+         // Цикл 2: проход по всем 256 каналам.
+         FOR #loop_k := 0 TO 255 DO
+            #phys_temp := #i[#loop_k];
+
+            // -1 = канал не используется, пропускаем (не диапазон, не дубликат).
+            IF #phys_temp <> -1 THEN
+
+               // ПРОВЕРКА 2: номер выхода в пределах physical_count.
+               IF (#phys_temp < 0) OR (#phys_temp >= #physical_count) THEN
+                  #validation_ok := FALSE;
+                  #error_range   := TRUE;
+                  IF #error_range_ch = -1 THEN
+                     #error_range_ch := #loop_k;
+                  END_IF;
+               ELSE
+                  // ПРОВЕРКА 3: дубликат.
+                  IF #phys_used[#phys_temp] THEN
+                     #validation_ok   := FALSE;
+                     #error_duplicate := TRUE;
+                     IF #error_channel_a = -1 THEN
+                        #error_channel_a := #loop_k;
+                        #error_channel_b := #phys_owner[#phys_temp];
+                     END_IF;
+                  ELSE
+                     #phys_used[#phys_temp]  := TRUE;
+                     #phys_owner[#phys_temp] := #loop_k;
+                  END_IF;
+               END_IF;
+            END_IF;
+         END_FOR;
+      END_IF;
+
+      // АТОМАРНОЕ ПРИМЕНЕНИЕ.
+      IF #validation_ok THEN
+         #active_count := 0;
+
+         // Цикл 3: копирование карты и подсчёт активных каналов.
+         FOR #loop_k := 0 TO 255 DO
+            #active_i[#loop_k]      := #i[#loop_k];
+            #active_invert[#loop_k] := #invert[#loop_k];
+            IF #i[#loop_k] <> -1 THEN
+               #active_count := #active_count + 1;
+            END_IF;
+         END_FOR;
+
+         #has_config    := TRUE;
+         #last_apply_ok := TRUE;
+      ELSE
+         #last_apply_ok := FALSE;
+      END_IF;
+   END_IF;
+
+   // =========================================================================
+   // БЛОК 3. РАБОЧИЙ ЦИКЛ: РАСКЛАДКА out -> Q по карте
+   // =========================================================================
+   // Цикл 1: обнуление образа выходов каждый скан (независимо от карты).
+   FOR #loop_k := 0 TO 255 DO
+      #Q[#loop_k] := FALSE;
+   END_FOR;
+
+   // Рабочий цикл — только если карта активна.
+   IF #has_config THEN
+      // Цикл 2: раскладка по всем каналам; -1 пропускается.
+      FOR #loop_k := 0 TO 255 DO
+         #phys_temp := #active_i[#loop_k];
+
+         // -1 = не используется; иначе — защита диапазона + запись.
+         IF #phys_temp <> -1 THEN
+            IF (#phys_temp >= 0) AND (#phys_temp < #physical_count) AND (#phys_temp <= 255) THEN
+               #Q[#phys_temp] := #out[#loop_k] XOR #active_invert[#loop_k];
+            END_IF;
+         END_IF;
+      END_FOR;
+   END_IF;
+
+   // Итоговые флаги для HMI.
+   #config_valid := #has_config;
+
+END_FUNCTION_BLOCK
